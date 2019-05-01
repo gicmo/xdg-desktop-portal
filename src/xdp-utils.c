@@ -193,6 +193,20 @@ xdp_app_info_get_id (XdpAppInfo *app_info)
   return app_info->id;
 }
 
+char *
+xdp_app_info_get_instance (XdpAppInfo *app_info)
+{
+  g_return_val_if_fail (app_info != NULL, NULL);
+
+  if (app_info->kind != XDP_APP_INFO_KIND_FLATPAK)
+    return NULL;
+
+  return g_key_file_get_string (app_info->u.flatpak.keyfile,
+				FLATPAK_METADATA_GROUP_INSTANCE,
+				FLATPAK_METADATA_KEY_INSTANCE_ID,
+				NULL);
+}
+
 gboolean
 xdp_app_info_is_host (XdpAppInfo *app_info)
 {
@@ -301,6 +315,7 @@ parse_app_info_from_flatpak_info (int pid, GError **error)
   g_autoptr(XdpAppInfo) app_info = NULL;
   const char *group;
   g_autofree char *id = NULL;
+  g_autofree char *instance = NULL;
 
   root_path = g_strdup_printf ("/proc/%u/root", pid);
   root_fd = openat (AT_FDCWD, root_path, O_RDONLY | O_NONBLOCK | O_DIRECTORY | O_CLOEXEC | O_NOCTTY);
