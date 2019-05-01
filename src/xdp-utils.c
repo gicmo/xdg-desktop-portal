@@ -20,6 +20,8 @@
 
 #include "config.h"
 
+#include <json-glib/json-glib.h>
+
 #include <string.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -120,6 +122,7 @@ struct _XdpAppInfo {
       struct
         {
           GKeyFile *keyfile;
+	  ino_t     pidns; /* pid namespace id */
         } flatpak;
       struct
         {
@@ -1190,4 +1193,402 @@ xdp_has_path_prefix (const char *str,
       if (*str != '/' && *str != 0)
         return FALSE;
     }
+}
+
+/* pid mapping helpers */
+#define DIR_OPEN_FLAGS (O_RDONLY | O_NONBLOCK | O_DIRECTORY | O_CLOEXEC | O_NOCTTY)
+
+static int
+parse_pid (const char *str, pid_t *pid)
+{
+  char *end;
+  guint64 p;
+
+ errno = 0;
+  p = g_ascii_strtoull (str, &end, 0);
+  if (end == str || errno != 0)
+    return -ENOENT;
+
+  if (pid)
+    *pid = (pid_t) p;
+
+  return 0;
+}
+
+static int
+parse_status_field_pid (char *val, pid_t *pid)
+{
+  const char *t;
+
+  t = strrchr (val, '\t');
+  if (t == NULL)
+    return -ENOENT;
+
+  return parse_pid (t, pid);
+}
+
+static int
+parse_status_field_uid (char *val, uid_t *uid)
+{
+  const char *t;
+  char *end;
+  guint64 p;
+
+  t = strrchr (val, '\t');
+  if (t == NULL)
+    return -ENOENT;
+
+  errno = 0;
+  p = g_ascii_strtoull (t, &end, 0);
+  if (end == t || errno != 0)
+    return -ENOENT;
+
+  if (uid)
+    *uid = (uid_t) p;
+
+  return 0;
+}
+
+static gboolean
+parse_status_file (int pid_fd, pid_t *pid_out, uid_t *uid_out, GError **error)
+{
+  g_autofree char *key = NULL;
+  g_autofree char *val = NULL;
+  gboolean have_pid = FALSE;
+  gboolean have_uid = FALSE;
+  FILE *f;
+  size_t keylen = 0;
+  size_t vallen = 0;
+  ssize_t n;
+  int fd;
+  int r = 0;
+
+  g_return_val_if_fail (pid_fd > -1, FALSE);
+  g_return_val_if_fail (error == NULL || *error == NULL, FALSE);
+
+  fd = openat (pid_fd, "status",  O_RDONLY | O_CLOEXEC);
+  if (fd == -1)
+    {
+      g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
+		   "could not open 'status' file: %s",
+		   g_strerror (errno));
+      return FALSE;
+    }
+
+  f = fdopen (fd, "r");
+
+  if (f == NULL)
+    {
+      int code = g_io_error_from_errno (errno);
+      g_set_error (error, G_IO_ERROR, code,
+		   "Could not open files: %s",
+		   g_strerror (errno));
+      (void) close (fd);
+      return FALSE;
+    }
+
+  fd = -1; /* fd is now owned by f */
+
+  do {
+    n = getdelim (&key, &keylen, ':', f);
+
+    if (n == -1)
+      break;
+
+    n = getdelim (&val, &vallen, '\n', f);
+
+    if (n == -1)
+      break;
+
+    g_strstrip (val);
+
+    if (!strncmp (key, "NSpid", strlen ("NSpid")))
+      {
+	r = parse_status_field_pid (val, pid_out);
+	have_pid = r > -1;
+      }
+    else if (!strncmp (key, "Uid", strlen ("Uid")))
+      {
+	r = parse_status_field_uid (val, uid_out);
+	have_uid = r > -1;
+      }
+
+  } while (r == 0 && (!have_uid || !have_pid));
+
+  fclose (f);
+
+  if (r != 0)
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+		   "Could not parse 'status' file");
+      return FALSE;
+    }
+  else if (!have_uid || !have_pid)
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+		   "Could not parse 'status' file: missing fields");
+
+      return FALSE;
+    }
+
+  return TRUE;
+}
+
+static gboolean
+lookup_ns_from_pid_fd (int pid_fd, ino_t *ns, GError **error)
+{
+  struct stat st;
+  int r;
+
+  g_return_val_if_fail (ns != NULL, FALSE);
+
+  r = fstatat (pid_fd, "ns/pid", &st, 0);
+  if (r == -1)
+    {
+      g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
+		   "failed to stat '%u/ns/pid': %s", (guint) pid_fd,
+		   g_strerror (errno));
+      return FALSE;
+    }
+
+  *ns = st.st_ino;
+
+  return TRUE;
+}
+
+static int
+open_pid_fd (int proc_fd, pid_t pid, GError **error)
+{
+  char buf[20] = {0, };
+  int fd;
+
+  snprintf (buf, sizeof(buf), "%u", (guint) pid);
+
+  fd = openat (proc_fd, buf, DIR_OPEN_FLAGS);
+
+  if (fd == -1)
+    g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
+		 "Could not to open '/proc/pid/%u': %s", (guint) pid,
+		 g_strerror (errno));
+
+  return fd;
+}
+
+/*  */
+
+static pid_t
+xdp_app_info_get_child_pid (XdpAppInfo *app_info,
+			    GError    **error)
+{
+  g_autoptr(JsonParser) parser = NULL;
+  g_autofree char *instance = NULL;
+  g_autofree char *data = NULL;
+  JsonNode *root;
+  JsonObject *cpo;
+  gsize len;
+  char *path;
+  pid_t pid;
+
+  g_return_val_if_fail (app_info != NULL, 0);
+
+  instance = xdp_app_info_get_instance (app_info);
+
+  if (instance == NULL)
+    return 0;
+
+  path = g_build_filename (g_get_user_runtime_dir (),
+			   ".flatpak",
+			   instance,
+			   "bwrapinfo.json",
+			   NULL);
+
+  if (!g_file_get_contents (path, &data, &len, error))
+    return 0;
+
+  parser = json_parser_new ();
+  if (!json_parser_load_from_data (parser, data, len, error))
+    {
+      g_prefix_error (error, "Could not parse '%s': ", path);
+      return 0;
+    }
+
+  root = json_parser_get_root (parser);
+  if (!root)
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+		   "Unexepcted empty file at '%s'", path);
+      return 0;
+    }
+
+  cpo = json_node_get_object (root);
+  if (cpo == NULL)
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+		   "Unexepcted empty file at '%s'", path);
+      return 0;
+    }
+
+  pid = json_object_get_int_member (cpo, "child-pid");
+  if (pid == 0)
+    g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+		 "Failed to get child pid member of '%s'", path);
+
+  return pid;
+}
+
+static gboolean
+xdg_app_info_ensure_pidns (XdpAppInfo  *app_info,
+			   DIR         *proc,
+			   GError     **error)
+{
+  xdp_autofd int fd = -1;
+  pid_t child_pid;
+  ino_t ns;
+  gboolean ok;
+
+  if (app_info->u.flatpak.pidns != 0)
+    return TRUE;
+
+  child_pid = xdp_app_info_get_child_pid (app_info, error);
+  if (child_pid == 0)
+    return FALSE;
+
+  fd = open_pid_fd (dirfd (proc), child_pid, error);
+  if (fd == -1)
+    return FALSE;
+
+  ok = lookup_ns_from_pid_fd (fd, &ns, NULL);
+  if (!ok)
+    return FALSE;
+
+  app_info->u.flatpak.pidns = ns;
+
+  return TRUE;
+}
+
+static gboolean
+find_pid (pid_t *pids, guint n_pids, pid_t want, guint *idx)
+{
+  for (guint i = 0; i < n_pids; i++)
+    {
+      if (pids[i] == want)
+	{
+	  *idx = i;
+	  return TRUE;
+	}
+    }
+
+  return FALSE;
+}
+
+static gboolean
+map_pids (DIR *proc, ino_t pidns, pid_t *pids, guint n_pids, GError **error)
+{
+  pid_t *res = NULL;
+  struct dirent *de;
+  guint count = 0;
+
+  res = g_alloca (sizeof (pid_t) * n_pids);
+
+  while ((de = readdir (proc)) != NULL)
+    {
+      xdp_autofd int pid_fd = -1;
+      pid_t outside;
+      pid_t inside;
+      guint idx;
+      gboolean ok;
+      ino_t ns;
+      int r;
+
+      if (de->d_type != DT_DIR)
+      	continue;
+
+      pid_fd = openat (dirfd (proc), de->d_name, DIR_OPEN_FLAGS);
+      if (pid_fd == -1)
+	continue;
+
+      ok = lookup_ns_from_pid_fd (pid_fd, &ns, NULL);
+      if (!ok)
+	continue;
+
+      if (pidns != ns)
+	continue;
+
+      r = parse_pid (de->d_name, &outside);
+      if (r < 0)
+	continue;
+
+      ok = parse_status_file (pid_fd, &inside, NULL, error);
+      if (!ok)
+	continue;
+
+      if (!find_pid (pids, n_pids, inside, &idx))
+	continue;
+
+      res[idx] = outside;
+      count++;
+    }
+
+  if (count != n_pids)
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND,
+		   "Could not map all pids");
+      return FALSE;
+    }
+
+  memcpy (pids, res, sizeof (pid_t) * n_pids);
+
+  return TRUE;
+}
+
+gboolean
+xdg_app_info_map_pids (XdpAppInfo  *app_info,
+		       pid_t       *pids,
+		       guint        n_pids,
+		       GError     **error)
+{
+  DIR *proc;
+  ino_t ns;
+  int fd;
+  gboolean ok;
+
+  g_return_val_if_fail (app_info != NULL, FALSE);
+  g_return_val_if_fail (pids != NULL, FALSE);
+
+  if (app_info->kind != XDP_APP_INFO_KIND_FLATPAK)
+    {
+      g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
+			   "Translating pids is not supported.");
+      return FALSE;
+    }
+
+  /*  */
+  fd = openat (AT_FDCWD, "/proc", DIR_OPEN_FLAGS);
+  if (fd == -1)
+    {
+      g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
+		   "could not open '/proc: %s", g_strerror (errno));
+      return FALSE;
+    }
+
+  proc = fdopendir (fd);
+  if (proc == NULL)
+    {
+      g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
+		   "could not open '/proc: %s", g_strerror (errno));
+      (void) close (fd);
+      return FALSE;
+    }
+
+  /*  */
+  ok = xdg_app_info_ensure_pidns (app_info, proc, error);
+  if (!ok)
+    goto out;
+
+  ns = app_info->u.flatpak.pidns;
+  ok = map_pids (proc, ns, pids, n_pids, error);
+
+ out:
+  closedir (proc);
+  return ok;
 }
