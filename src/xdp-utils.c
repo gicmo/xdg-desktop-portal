@@ -292,8 +292,6 @@ static XdpAppInfo *
 parse_app_info_from_flatpak_info (int pid, GError **error)
 {
   g_autofree char *root_path = NULL;
-  g_autofree char *path = NULL;
-  g_autofree char *content = NULL;
   int root_fd = -1;
   int info_fd = -1;
   struct stat stat_buf;
