@@ -48,10 +48,17 @@
 typedef struct _GameMode GameMode;
 typedef struct _GameModeClass GameModeClass;
 
-static gboolean handle_action (XdpGameMode *object,
-			       GDBusMethodInvocation *invocation,
-			       GUnixFDList *fds,
-			       GVariant    *params);
+static gboolean handle_query_status (XdpGameMode *object,
+				     GDBusMethodInvocation *invocation,
+				     GVariant *arg_pid);
+
+static gboolean handle_register_game (XdpGameMode *object,
+				      GDBusMethodInvocation *invocation,
+				      GVariant *arg_pid);
+
+static  gboolean handle_unregister_game (XdpGameMode *object,
+					 GDBusMethodInvocation *invocation,
+					 GVariant *arg_pid);
 
 /* globals  */
 static GameMode *gamemode;
@@ -80,7 +87,9 @@ G_DEFINE_TYPE_WITH_CODE (GameMode, gamemode, XDP_TYPE_GAME_MODE_SKELETON,
 static void
 gamemode_iface_init (XdpGameModeIface *iface)
 {
-  iface->handle_action = handle_action;
+  iface->handle_query_status = handle_query_status;
+  iface->handle_register_game = handle_register_game;
+  iface->handle_unregister_game = handle_unregister_game;
 }
 
 static void
@@ -96,69 +105,6 @@ gamemode_class_init (GameModeClass *klass)
 
 /* internal */
 
-static ssize_t
-recv_fd (int sock, char *data, size_t len, struct ucred *ucred, int *fd_out)
-{
-  const size_t ucred_size = sizeof (struct ucred);
-  struct iovec iov = {
-    .iov_base = data,
-    .iov_len = len,
-  };
-  union {
-    struct cmsghdr cmh;
-    char   data[CMSG_SPACE (sizeof (int)) +
-		CMSG_SPACE (ucred_size)];
-  } ctrl;
-  struct msghdr hdr = {
-    .msg_iov = &iov,
-    .msg_iovlen = 1,
-    .msg_control = &ctrl,
-    .msg_controllen = sizeof (ctrl),
-  };
-  int fd = -1;
-  int r;
-
-  r = recvmsg (sock, &hdr, MSG_CMSG_CLOEXEC | MSG_TRUNC);
-
-  if (r < 0)
-    return -errno;
-
-  for (struct cmsghdr *c = CMSG_FIRSTHDR (&hdr);
-       c != NULL;
-       c = CMSG_NXTHDR (&hdr, c))
-    {
-      if (c->cmsg_level != SOL_SOCKET)
-        continue;
-
-      if (c->cmsg_type == SCM_CREDENTIALS &&
-          c->cmsg_len == CMSG_LEN (ucred_size))
-	{
-	  if (ucred != NULL)
-	    memcpy (ucred, CMSG_DATA (c), ucred_size);
-	}
-      else if (c->cmsg_type == SCM_RIGHTS)
-	{
-	  size_t l = (c->cmsg_len - CMSG_LEN(0)) / sizeof (int);
-
-	  if (l == 0)
-	    continue;
-	  else if (l > 1)
-	    return -EIO;
-
-	  memcpy (&fd, CMSG_DATA (c), sizeof (int));
-	}
-    }
-
-  if (fd)
-    {
-      if (fd_out)
-	*fd_out = fd;
-      else
-	(void) close (fd);
-    }
-
-  return r;
-}
 
 /* dbus  */
 static void
@@ -182,76 +128,11 @@ got_gamemode_reply (GObject      *source,
 }
 
 static gboolean
-handle_action (XdpGameMode *object,
-	       GDBusMethodInvocation *invocation,
-	       GUnixFDList *fd_list,
-	       GVariant    *params)
+make_call_simple (XdpGameMode *object,
+		  GDBusMethodInvocation *invocation,
+		  GVariant    *params)
 {
-  g_autofree int *fds = NULL;
-  struct ucred u = {0, };
-  char msg[1024] = {0, };
-  socklen_t n;
-  int data = -1;
-  int index;
-  int n_fds;
-  int r;
-
-  if (g_unix_fd_list_get_length (fd_list) != 1)
-    {
-      g_dbus_method_invocation_return_error (invocation,
-					     G_DBUS_ERROR,
-					     G_DBUS_ERROR_INVALID_ARGS,
-					     "Exactly one file descriptor should be passed");
-      return TRUE;
-    }
-
-  g_variant_get (params, "h", &index);
-  if (index != 0)
-    {
-      g_dbus_method_invocation_return_error (invocation,
-					     G_DBUS_ERROR,
-					     G_DBUS_ERROR_INVALID_ARGS,
-					     "Bad file descriptor index %d", index);
-      return TRUE;
-    }
-
-  fds = g_unix_fd_list_steal_fds (fd_list, &n_fds);
-  r = recv_fd (fds[0], msg, sizeof (msg) - 1, NULL, &data);
-
-  (void) close (fds[0]);
-
-  if (r < 0)
-    {
-      g_dbus_method_invocation_return_error (invocation,
-					     G_DBUS_ERROR,
-					     G_DBUS_ERROR_INVALID_ARGS,
-					     "Could not receive fd: %s",
-					     g_strerror (-r));
-      return TRUE;
-    }
-
-  n = sizeof (u);
-  r = getsockopt (data, SOL_SOCKET, SO_PEERCRED, &u, &n);
-
-  (void) close (data);
-
-  if (r < 0)
-    {
-      g_dbus_method_invocation_return_error (invocation,
-					     G_DBUS_ERROR,
-					     G_DBUS_ERROR_INVALID_ARGS,
-					     "Could not remote credentials: %s",
-					     g_strerror (errno));
-      return TRUE;
-    }
-  else if (u.pid == 0)
-    {
-
-    }
-
-
-  g_debug ("gamemode action: %s: %d, %d, %d\n", msg,
-	   (int) u.uid, (int) u.gid, (int) u.pid);
+ 
 
   g_dbus_proxy_call (G_DBUS_PROXY (gamemode->client),
                      msg,
@@ -263,6 +144,30 @@ handle_action (XdpGameMode *object,
                      g_object_ref (invocation));
 
   return TRUE;
+}
+
+static gboolean
+handle_query_status (XdpGameMode *object,
+		     GDBusMethodInvocation *invocation,
+		     GVariant *arg_pid)
+{
+  
+}
+
+static gboolean
+handle_register_game (XdpGameMode *object,
+		      GDBusMethodInvocation *invocation,
+		      GVariant *arg_pid)
+{
+
+}
+
+static  gboolean
+handle_unregister_game (XdpGameMode *object,
+			GDBusMethodInvocation *invocation,
+			GVariant *arg_pid)
+{
+
 }
 
 /* public API */

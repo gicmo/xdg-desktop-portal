@@ -25,12 +25,19 @@
 
       Interface for accessing GameMode from within the sandbox.
 
-      This documentation describes version 1 of this interface.
-  -->
+This documentation describes version 1 of this interface.
+    -->
     <interface name="org.freedesktop.portal.GameMode">
-      <method name="Action">
-	<annotation name="org.gtk.GDBus.C.UnixFD" value="true"/>
-	<arg type="h" name="index" direction="in"/>
+      <method name="QueryStatus">
+	<arg type="i" name="pid" direction="in"/>
+	<arg type="i" name="result" direction="out"/>
+      </method>
+      <method name="RegisterGame">
+	<arg type="i" name="pid" direction="in"/>
+	<arg type="i" name="result" direction="out"/>
+      </method>
+      <method name="UnregisterGame">
+	<arg type="i" name="pid" direction="in"/>
 	<arg type="i" name="result" direction="out"/>
       </method>
     </interface>
